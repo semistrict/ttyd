@@ -608,6 +608,10 @@ int main(int argc, char **argv) {
     // Client mode: no listening, use client protocols
     info.port = CONTEXT_PORT_NO_LISTEN;
     info.protocols = client_protocols;
+#if defined(LWS_OPENSSL_SUPPORT) || defined(LWS_WITH_TLS)
+    // Enable TLS for outbound wss:// connections
+    info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+#endif
   } else {
     info.options |= LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
   }
@@ -644,7 +648,7 @@ int main(int argc, char **argv) {
 
     bool use_ssl = (strcmp(prot, "wss") == 0 || strcmp(prot, "https") == 0);
     if (use_ssl) {
-      ccinfo.ssl_connection = LCCSCF_USE_SSL;
+      ccinfo.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
     }
 
     if (lws_client_connect_via_info(&ccinfo) == NULL) {
