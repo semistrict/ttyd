@@ -12,28 +12,29 @@
 
 const { WebSocketServer } = require('ws');
 const { spawn } = require('child_process');
-const { createCipheriv, createDecipheriv, randomBytes } = require('crypto');
+const { createCipheriv, createDecipheriv, createHmac, randomBytes } = require('crypto');
 const path = require('path');
 
 const TTYD = process.argv[2] || path.join(__dirname, '..', 'build', 'ttyd');
 const PORT = 0; // let the OS pick a free port
-const SHARED_KEY = randomBytes(32);
-const SHARED_KEY_ARG = SHARED_KEY.toString('base64url');
+const WRITE_KEY = randomBytes(32);
+const READ_KEY = createHmac('sha256', WRITE_KEY).update('ttyd-relay read key v1').digest();
+const WRITE_KEY_ARG = WRITE_KEY.toString('base64url');
 
-function encryptPayload(plaintext) {
+function encryptPayload(key, plaintext) {
   const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', SHARED_KEY, iv);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([iv, ciphertext, tag]);
 }
 
-function decryptPayload(payload) {
+function decryptPayload(key, payload) {
   if (payload.length < 28) throw new Error('encrypted payload too short');
   const iv = payload.subarray(0, 12);
   const ciphertext = payload.subarray(12, payload.length - 16);
   const tag = payload.subarray(payload.length - 16);
-  const decipher = createDecipheriv('aes-256-gcm', SHARED_KEY, iv);
+  const decipher = createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
@@ -78,7 +79,7 @@ function runTest(wss, port) {
         const rawPayload = buf.slice(1);
         let payload;
         try {
-          payload = decryptPayload(rawPayload).toString();
+          payload = decryptPayload(READ_KEY, rawPayload).toString();
         } catch (err) {
           clearTimeout(timeout);
           reject(err);
@@ -105,14 +106,14 @@ function runTest(wss, port) {
             if (!sentInput) {
               sentInput = true;
               const input = 'echo OUTBOUND_TEST_OK\n';
-              const encrypted = encryptPayload(Buffer.from(input));
+              const encrypted = encryptPayload(WRITE_KEY, Buffer.from(input));
               const msg = Buffer.alloc(1 + encrypted.length);
               msg[0] = '0'.charCodeAt(0); // INPUT
               encrypted.copy(msg, 1);
               ws.send(msg);
 
               setTimeout(() => {
-                const exitPayload = encryptPayload(Buffer.from('exit\n'));
+                const exitPayload = encryptPayload(WRITE_KEY, Buffer.from('exit\n'));
                 const exitMsg = Buffer.alloc(1 + exitPayload.length);
                 exitMsg[0] = '0'.charCodeAt(0);
                 exitPayload.copy(exitMsg, 1);
@@ -131,7 +132,73 @@ function runTest(wss, port) {
     });
 
     // Launch ttyd in client mode
-    const ttyd = spawn(TTYD, ['--connect-shared-key', SHARED_KEY_ARG, '--connect', `ws://localhost:${port}`, '-W', 'bash'], {
+    const ttyd = spawn(TTYD, ['--connect-write-key', WRITE_KEY_ARG, '--connect', `ws://localhost:${port}`, '-W', 'bash'], {
+      stdio: 'ignore',
+    });
+
+    ttyd.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(new Error(`failed to spawn ttyd: ${err.message}`));
+    });
+  });
+}
+
+function runReadOnlyAdversaryTest(wss, port) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('read-only adversary test timed out after 10s')), 10000);
+    const results = {
+      connected: false,
+      rejectedReadOnlyInput: true,
+    };
+
+    wss.on('connection', (ws) => {
+      results.connected = true;
+      let sentBadInput = false;
+      let finished = false;
+
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        resolve(results);
+      };
+
+      ws.on('message', (data) => {
+        const buf = Buffer.from(data);
+        const cmd = String.fromCharCode(buf[0]);
+        const rawPayload = buf.slice(1);
+        if (cmd !== '0') return;
+
+        let payload = '';
+        try {
+          payload = decryptPayload(READ_KEY, rawPayload).toString();
+        } catch {}
+
+        if (payload.includes('READ_KEY_SHOULD_NOT_WORK')) {
+          results.rejectedReadOnlyInput = false;
+          clearTimeout(timeout);
+          reject(new Error('read-only key was unexpectedly accepted for input'));
+          return;
+        }
+
+        if (!sentBadInput) {
+          sentBadInput = true;
+          const encrypted = encryptPayload(READ_KEY, Buffer.from('echo READ_KEY_SHOULD_NOT_WORK\n'));
+          const msg = Buffer.alloc(1 + encrypted.length);
+          msg[0] = '0'.charCodeAt(0);
+          encrypted.copy(msg, 1);
+          ws.send(msg);
+          setTimeout(() => {
+            try { ws.close(); } catch {}
+            finish();
+          }, 700);
+        }
+      });
+
+      ws.on('close', () => finish());
+    });
+
+    const ttyd = spawn(TTYD, ['--connect-write-key', WRITE_KEY_ARG, '--connect', `ws://localhost:${port}`, '-W', 'bash'], {
       stdio: 'ignore',
     });
 
@@ -143,34 +210,49 @@ function runTest(wss, port) {
 }
 
 async function main() {
-  const { wss, port } = await startServer();
-  console.log(`test server listening on port ${port}`);
+  const checks = [];
 
-  try {
-    const results = await runTest(wss, port);
-
-    console.log('');
-    const checks = [
-      ['Client connected', results.connected],
-      ['SET_WINDOW_TITLE received', results.gotTitle],
-      ['SET_PREFERENCES received', results.gotPrefs],
-      ['OUTPUT received', results.gotOutput],
-      ['Remote input echoed back', results.inputEchoed],
-      ['Wire payloads encrypted', results.payloadsEncrypted],
-      ['Clean disconnect (code 1000)', results.cleanClose],
-    ];
-
-    let allPass = true;
-    for (const [name, pass] of checks) {
-      console.log(`  ${pass ? 'PASS' : 'FAIL'}  ${name}`);
-      if (!pass) allPass = false;
+  {
+    const { wss, port } = await startServer();
+    console.log(`test server listening on port ${port}`);
+    try {
+      const results = await runTest(wss, port);
+      checks.push(
+        ['Client connected', results.connected],
+        ['SET_WINDOW_TITLE received', results.gotTitle],
+        ['SET_PREFERENCES received', results.gotPrefs],
+        ['OUTPUT received', results.gotOutput],
+        ['Remote input echoed back', results.inputEchoed],
+        ['Wire payloads encrypted', results.payloadsEncrypted],
+        ['Clean disconnect (code 1000)', results.cleanClose],
+      );
+    } finally {
+      wss.close();
     }
-
-    console.log(`\n${allPass ? 'ALL PASS' : 'SOME FAILED'}`);
-    process.exit(allPass ? 0 : 1);
-  } finally {
-    wss.close();
   }
+
+  {
+    const { wss, port } = await startServer();
+    try {
+      const results = await runReadOnlyAdversaryTest(wss, port);
+      checks.push(
+        ['Read-only adversary connected', results.connected],
+        ['Read key cannot write input', results.rejectedReadOnlyInput],
+      );
+    } finally {
+      wss.close();
+    }
+  }
+
+  console.log('');
+  let allPass = true;
+  for (const [name, pass] of checks) {
+    console.log(`  ${pass ? 'PASS' : 'FAIL'}  ${name}`);
+    if (!pass) allPass = false;
+  }
+
+  console.log(`\n${allPass ? 'ALL PASS' : 'SOME FAILED'}`);
+  process.exit(allPass ? 0 : 1);
 }
 
 main().catch((err) => {

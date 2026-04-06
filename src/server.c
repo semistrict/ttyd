@@ -13,6 +13,7 @@
 
 #ifdef TTYD_OPENSSL_CRYPTO
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #endif
 
 #include "utils.h"
@@ -92,6 +93,7 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"browser", no_argument, NULL, 'B'},
                                         {"connect", required_argument, NULL, 256},
                                         {"connect-shared-key", required_argument, NULL, 257},
+                                        {"connect-write-key", required_argument, NULL, 258},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
@@ -141,8 +143,9 @@ static void print_help() {
 #endif
           "        --connect            Connect to a remote WebSocket URL instead of listening (client mode,\n"
           "                               eg: ws://host:port/path or wss://host:port/path)\n"
-          "        --connect-shared-key Base64url-encoded 32-byte key for local-only payload encryption in\n"
-          "                               --connect mode. The key is never sent over the websocket.\n"
+          "        --connect-write-key  Base64url-encoded 32-byte write key for local-only payload encryption in\n"
+          "                               --connect mode. ttyd derives a separate read key and never sends either key.\n"
+          "        --connect-shared-key Deprecated alias for --connect-write-key.\n"
           "    -d, --debug             Set log level (default: 7)\n"
           "    -v, --version           Print the version and exit\n"
           "    -h, --help              Print this text and exit\n\n"
@@ -166,7 +169,7 @@ static void print_config() {
     lwsl_notice("  websocket: %s\n", endpoints.ws);
   }
   if (server->connect_url != NULL) lwsl_notice("  connect URL: %s\n", server->connect_url);
-  if (server->connect_shared_key_enabled) lwsl_notice("  connect payload encryption: true\n");
+  if (server->connect_keys_enabled) lwsl_notice("  connect payload encryption: split read/write keys\n");
   if (server->auth_header != NULL) lwsl_notice("  auth header: %s\n", server->auth_header);
   if (server->check_origin) lwsl_notice("  check origin: true\n");
   if (server->url_arg) lwsl_notice("  allow url arg: true\n");
@@ -282,16 +285,16 @@ static int parse_int(char *name, char *str) {
   return (int)val;
 }
 
-static int parse_connect_shared_key(const char *encoded, unsigned char out[32]) {
+static int parse_connect_write_key(const char *encoded, unsigned char out[32]) {
 #ifndef TTYD_OPENSSL_CRYPTO
   (void)encoded;
   (void)out;
-  fprintf(stderr, "ttyd: --connect-shared-key requires an OpenSSL-enabled build\n");
+  fprintf(stderr, "ttyd: --connect-write-key requires an OpenSSL-enabled build\n");
   return -1;
 #else
   size_t input_len = strlen(encoded);
   if (input_len == 0 || input_len > 64) {
-    fprintf(stderr, "ttyd: invalid --connect-shared-key length\n");
+    fprintf(stderr, "ttyd: invalid --connect-write-key length\n");
     return -1;
   }
 
@@ -312,7 +315,7 @@ static int parse_connect_shared_key(const char *encoded, unsigned char out[32]) 
   int decoded_len = EVP_DecodeBlock(decoded, (const unsigned char *)standard, (int)standard_len);
   free(standard);
   if (decoded_len < 0) {
-    fprintf(stderr, "ttyd: invalid --connect-shared-key encoding\n");
+    fprintf(stderr, "ttyd: invalid --connect-write-key encoding\n");
     return -1;
   }
 
@@ -324,12 +327,29 @@ static int parse_connect_shared_key(const char *encoded, unsigned char out[32]) 
   }
   decoded_len -= padding;
   if (decoded_len != 32) {
-    fprintf(stderr, "ttyd: --connect-shared-key must decode to exactly 32 bytes\n");
+    fprintf(stderr, "ttyd: --connect-write-key must decode to exactly 32 bytes\n");
     return -1;
   }
 
   memcpy(out, decoded, 32);
   return 0;
+#endif
+}
+
+static int derive_connect_read_key(const unsigned char write_key[32], unsigned char read_key[32]) {
+#ifndef TTYD_OPENSSL_CRYPTO
+  (void)write_key;
+  (void)read_key;
+  return -1;
+#else
+  // Derive a separate read-only capability from the write key with a
+  // domain-separated HMAC. Anybody who only has the read key can decrypt
+  // server->client traffic, but cannot feasibly recover the write key and
+  // therefore cannot forge client->server input for an existing session.
+  static const unsigned char label[] = "ttyd-relay read key v1";
+  unsigned int out_len = 0;
+  unsigned char *result = HMAC(EVP_sha256(), write_key, 32, label, sizeof(label) - 1, read_key, &out_len);
+  return (result != NULL && out_len == 32) ? 0 : -1;
 #endif
 }
 
@@ -572,8 +592,13 @@ int main(int argc, char **argv) {
         server->connect_url = strdup(optarg);
         break;
       case 257:
-        if (parse_connect_shared_key(optarg, server->connect_shared_key) != 0) return -1;
-        server->connect_shared_key_enabled = true;
+      case 258:
+        if (parse_connect_write_key(optarg, server->connect_write_key) != 0) return -1;
+        if (derive_connect_read_key(server->connect_write_key, server->connect_read_key) != 0) {
+          fprintf(stderr, "ttyd: failed to derive connect read key\n");
+          return -1;
+        }
+        server->connect_keys_enabled = true;
         break;
       case '?':
         break;
@@ -607,8 +632,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ttyd: missing start command\n");
     return -1;
   }
-  if (server->connect_shared_key_enabled && server->connect_url == NULL) {
-    fprintf(stderr, "ttyd: --connect-shared-key requires --connect\n");
+  if (server->connect_keys_enabled && server->connect_url == NULL) {
+    fprintf(stderr, "ttyd: --connect-write-key requires --connect\n");
     return -1;
   }
 

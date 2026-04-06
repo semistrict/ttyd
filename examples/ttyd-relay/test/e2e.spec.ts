@@ -13,7 +13,7 @@ const SESSION_ID_RE = /\/session\/[A-Za-z0-9_-]{22}$/;
 
 function startTtyd(wsUrl: string, command: string[], sharedKey?: string): ChildProcess {
   const args = [];
-  if (sharedKey) args.push("--connect-shared-key", sharedKey);
+  if (sharedKey) args.push("--connect-write-key", sharedKey);
   args.push("--connect", wsUrl, "-W", ...command);
   return spawn(TTYD_BIN, args, { stdio: "pipe" });
 }
@@ -43,11 +43,11 @@ async function getWsUrl(page: import("@playwright/test").Page): Promise<string> 
   return wsUrl!;
 }
 
-async function getSharedKey(page: import("@playwright/test").Page): Promise<string> {
+async function getWriteKey(page: import("@playwright/test").Page): Promise<string> {
   const key = await page.evaluate(() => {
     const parts = location.pathname.split('/');
     const sessionId = parts[parts.indexOf('session') + 1];
-    return localStorage.getItem(`ttyd-ui:key:${sessionId}`);
+    return localStorage.getItem(`ttyd-ui:write:${sessionId}`);
   });
   expect(key).toBeTruthy();
   return key!;
@@ -57,22 +57,27 @@ async function getTabLabels(page: import("@playwright/test").Page): Promise<stri
   return page.locator("#tab-list .tab-item .tab-name").allTextContents();
 }
 
+async function getReadLink(page: import("@playwright/test").Page): Promise<string> {
+  return page.evaluate(() => location.href);
+}
+
 test.describe("home page", () => {
   test("root opens a base64 session with a tab", async ({ page }) => {
     await page.goto("/");
-    await expect(page).toHaveURL(SESSION_ID_RE);
+    await expect.poll(() => page.evaluate(() => location.pathname)).toMatch(SESSION_ID_RE);
+    await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#r=[A-Za-z0-9_-]{43}$/);
     await expect(page.locator(".waiting .cmd").first()).toContainText("curl -sN");
   });
 
   test("root reuses stored session id", async ({ page }) => {
     await page.goto("/");
-    await expect(page).toHaveURL(SESSION_ID_RE);
-    const firstUrl = page.url();
+    await expect.poll(() => page.evaluate(() => location.pathname)).toMatch(SESSION_ID_RE);
+    const firstPath = await page.evaluate(() => location.pathname);
     const storedId = await page.evaluate(() => localStorage.getItem("ttyd-session-id"));
     expect(storedId).toBeTruthy();
     await page.goto("/");
-    await expect(page).toHaveURL(firstUrl);
-    await expect(page).toHaveURL(new RegExp(`/session/${storedId}$`));
+    await expect.poll(() => page.evaluate(() => location.pathname)).toBe(firstPath);
+    await expect.poll(() => page.evaluate(() => location.pathname)).toBe(`/session/${storedId}`);
   });
 });
 
@@ -80,12 +85,14 @@ test.describe("session page", () => {
   test("first tab shows connect command", async ({ page }) => {
     await page.goto("/session/test-session");
     const cmd = page.locator(".waiting .cmd").first();
-    const sharedKey = await getSharedKey(page);
+    const sharedKey = await getWriteKey(page);
+    await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#r=[A-Za-z0-9_-]{43}$/);
+    await expect.poll(() => page.evaluate(() => location.hash.includes('#w='))).toBe(false);
     await expect(cmd).toContainText("curl -sN", { timeout: 5000 });
     await expect(cmd).toContainText("/session/test-session/urls");
-    await expect(cmd).toContainText("--connect-shared-key");
+    await expect(cmd).toContainText("--connect-write-key");
     await expect(cmd).toContainText(sharedKey);
-    await expect(cmd).toContainText("while read -r _url; do ttyd --connect-shared-key");
+    await expect(cmd).toContainText("while read -r _url; do ttyd --connect-write-key");
     await expect(cmd).toContainText("test-session");
     // No token in the URL
     await expect(cmd).not.toContainText("token=");
@@ -100,6 +107,55 @@ test.describe("session page", () => {
     await expect(page.locator(".waiting .copy-btn")).toHaveText("✓");
     const clip = await page.evaluate(() => navigator.clipboard.readText());
     expect(clip).toBe(cmdText);
+  });
+
+  test("copy read and write link buttons expose the right capabilities", async ({ page, context }) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto("/session/link-copy-test");
+    const writeKey = await getWriteKey(page);
+
+    await page.click("#btn-copy-read");
+    const readLink = await page.evaluate(() => navigator.clipboard.readText());
+    expect(readLink).toContain("#r=");
+    expect(readLink).not.toContain("#w=");
+    expect(readLink).not.toContain(writeKey);
+
+    await page.click("#btn-copy-write");
+    const writeLink = await page.evaluate(() => navigator.clipboard.readText());
+    expect(writeLink).toContain(`#w=${writeKey}`);
+  });
+
+  test("read-only link can view but cannot write or create tabs", async ({ page, browser }) => {
+    await page.goto("/session/readonly-test");
+    const writeKey = await getWriteKey(page);
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], writeKey);
+
+    const readerContext = await browser.newContext();
+    try {
+      await waitForTtydConnected(ttyd);
+      await expect(page.locator("textarea.xterm-helper-textarea")).toBeVisible({ timeout: 5000 });
+
+      const readLink = await getReadLink(page);
+      const reader = await readerContext.newPage();
+      await reader.goto(readLink);
+
+      await expect(reader.locator(".terminal-pane.active .xterm-screen")).toBeVisible({ timeout: 5000 });
+      await expect(reader.locator("#btn-new")).toBeDisabled();
+      await expect(reader.locator("#btn-copy-write")).toBeDisabled();
+
+      const readerWriteKey = await reader.evaluate(() => {
+        const parts = location.pathname.split('/');
+        const sessionId = parts[parts.indexOf('session') + 1];
+        return localStorage.getItem(`ttyd-ui:write:${sessionId}`);
+      });
+      expect(readerWriteKey).toBeNull();
+
+      await reader.keyboard.press("Control+Shift+N");
+      await expect(reader.locator("#tab-list .tab-item")).toHaveCount(1);
+    } finally {
+      await readerContext.close();
+      ttyd.kill();
+    }
   });
 
   test("Ctrl+Shift+N creates a new tab in sidebar", async ({ page }) => {
@@ -123,7 +179,7 @@ test.describe("session page", () => {
     });
     const currentUrl = page.url();
     await page.click("#btn-session");
-    await expect(page).toHaveURL(SESSION_ID_RE);
+    await expect.poll(() => page.evaluate(() => location.pathname)).toMatch(SESSION_ID_RE);
     expect(page.url()).not.toBe(currentUrl);
     const state = await page.evaluate(() => ({
       sessionId: localStorage.getItem("ttyd-session-id"),
@@ -136,7 +192,7 @@ test.describe("session page", () => {
 
   test("double click sets a manual label that overrides terminal title", async ({ page }) => {
     await page.goto("/session/rename-test");
-    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       page.once("dialog", (dialog) => dialog.accept("api"));
@@ -158,7 +214,7 @@ test.describe("session page", () => {
 
   test("OSC 7 updates tab label from cwd", async ({ page }) => {
     await page.goto("/session/osc7-test");
-    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       const textarea = page.locator("textarea.xterm-helper-textarea");
@@ -172,7 +228,7 @@ test.describe("session page", () => {
 
   test("tab label includes both terminal title and cwd", async ({ page }) => {
     await page.goto("/session/title-cwd-test");
-    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       const textarea = page.locator("textarea.xterm-helper-textarea");
@@ -180,8 +236,29 @@ test.describe("session page", () => {
       await textarea.focus();
       await page.keyboard.type(`printf '\\033]0;api\\007\\033]7;${OSC7_SERVER_URI}\\007'`);
       await page.keyboard.press("Enter");
-      await expect(page.locator("#tab-list .tab-item .tab-name").first()).toHaveText("api · ttyd-relay", { timeout: 5000 });
+      await expect(page.locator("#tab-list .tab-item .tab-name").first()).toHaveText("ttyd-relay · api", { timeout: 5000 });
     } finally { ttyd.kill(); }
+  });
+
+  test("sidebar can be resized and persists across reload", async ({ page }) => {
+    await page.goto("/session/sidebar-resize-test");
+    const sidebar = page.locator("#sidebar");
+    const resizer = page.locator("#sidebar-resizer");
+    const before = await sidebar.boundingBox();
+    expect(before).toBeTruthy();
+
+    const handle = await resizer.boundingBox();
+    expect(handle).toBeTruthy();
+    await page.mouse.move(handle!.x + handle!.width / 2, handle!.y + handle!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(handle!.x + 90, handle!.y + handle!.height / 2, { steps: 8 });
+    await page.mouse.up();
+
+    await expect.poll(async () => (await sidebar.boundingBox())?.width ?? 0).toBeGreaterThan((before?.width ?? 0) + 60);
+    const resizedWidth = (await sidebar.boundingBox())?.width ?? 0;
+
+    await page.reload();
+    await expect.poll(async () => (await page.locator("#sidebar").boundingBox())?.width ?? 0).toBeGreaterThan(resizedWidth - 8);
   });
 
   test("pinning moves a tab ahead of regular tabs", async ({ page }) => {
@@ -210,7 +287,7 @@ test.describe("terminal connection", () => {
     await page.goto("/session/e2e-connect");
     await expect(page.locator(".waiting .cmd").first()).toContainText("curl -sN", { timeout: 5000 });
     const wsUrl = await getWsUrl(page);
-    const ttyd = startTtyd(wsUrl, ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(wsUrl, ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       await expect(page.locator("textarea.xterm-helper-textarea")).toBeVisible({ timeout: 5000 });
@@ -227,7 +304,7 @@ test.describe("terminal connection", () => {
     const ttyd = startTtyd(
       `${WS_BASE_URL}/session/e2e-auto/ws/terminal/my-server`,
       ["bash"],
-      await getSharedKey(page)
+      await getWriteKey(page)
     );
     try {
       await waitForTtydConnected(ttyd);
@@ -241,7 +318,7 @@ test.describe("terminal connection", () => {
   test("typing executes in shell", async ({ page }) => {
     await page.goto("/session/e2e-type");
     await expect(page.locator(".waiting .cmd").first()).toContainText("curl -sN", { timeout: 5000 });
-    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       const textarea = page.locator("textarea.xterm-helper-textarea");
@@ -260,7 +337,7 @@ test.describe("terminal connection", () => {
   test("UTF-8 characters work", async ({ page }) => {
     await page.goto("/session/e2e-utf8");
     await expect(page.locator(".waiting .cmd").first()).toContainText("curl -sN", { timeout: 5000 });
-    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       const textarea = page.locator("textarea.xterm-helper-textarea");
@@ -279,7 +356,7 @@ test.describe("terminal connection", () => {
   test("TUI program (top) runs without crashing", async ({ page }) => {
     await page.goto("/session/e2e-top");
     await expect(page.locator(".waiting .cmd").first()).toContainText("curl -sN", { timeout: 5000 });
-    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       const textarea = page.locator("textarea.xterm-helper-textarea");
@@ -314,7 +391,7 @@ test.describe("terminal connection", () => {
     await page.goto("/session/e2e-multi");
     await expect(page.locator(".waiting .cmd").first()).toContainText("curl -sN", { timeout: 5000 });
     const wsUrl1 = await getWsUrl(page);
-    const sharedKey = await getSharedKey(page);
+    const sharedKey = await getWriteKey(page);
 
     await page.keyboard.press("Control+Shift+N");
     await expect(page.locator("#tab-list .tab-item")).toHaveCount(2);
@@ -354,7 +431,7 @@ test.describe("duplicate connections", () => {
   test("same URL twice creates two separate tabs", async ({ page }) => {
     await page.goto("/session/e2e-dup");
     await expect(page.locator("#tab-list .tab-item")).toHaveCount(1, { timeout: 5000 });
-    const sharedKey = await getSharedKey(page);
+    const sharedKey = await getWriteKey(page);
 
     const wsUrl = `${WS_BASE_URL}/session/e2e-dup/ws/terminal/shell`;
 
@@ -408,7 +485,7 @@ test.describe("terminal title", () => {
   test("tab title updates from terminal escape sequence", async ({ page }) => {
     await page.goto("/session/e2e-title");
     await expect(page.locator(".waiting .cmd").first()).toContainText("curl -sN", { timeout: 5000 });
-    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getSharedKey(page));
+    const ttyd = startTtyd(await getWsUrl(page), ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd);
       const textarea = page.locator("textarea.xterm-helper-textarea");
@@ -432,7 +509,7 @@ test.describe("terminal bell", () => {
     await page.keyboard.press("Control+Shift+N");
     await expect(page.locator("#tab-list .tab-item")).toHaveCount(2);
 
-    const ttyd1 = startTtyd(wsUrl1, ["bash"], await getSharedKey(page));
+    const ttyd1 = startTtyd(wsUrl1, ["bash"], await getWriteKey(page));
     try {
       await waitForTtydConnected(ttyd1);
 
@@ -485,7 +562,7 @@ test.describe("streaming /urls endpoint", () => {
     const sessionId = `e2e-stream-ttyd-${Date.now()}`;
     await page.goto(`/session/${sessionId}`);
     await expect(page.locator("#tab-list .tab-item")).toHaveCount(1, { timeout: 5000 });
-    const sharedKey = await getSharedKey(page);
+    const sharedKey = await getWriteKey(page);
 
     const { spawn } = await import("child_process");
     const curl = spawn("curl", ["-sN", `${BASE_URL}/session/${sessionId}/urls`], { stdio: "pipe" });
@@ -540,7 +617,7 @@ test.describe("streaming /urls endpoint", () => {
     await expect(page.locator("#tab-list .tab-item")).toHaveCount(1, { timeout: 5000 });
 
     const suggested = await page.locator(".waiting .cmd").first().textContent();
-    expect(suggested).toContain("--connect-shared-key");
+    expect(suggested).toContain("--connect-write-key");
     const cmd = suggested!.replace(/\bttyd\b/g, shellQuote(TTYD_BIN));
     const listener = spawn("bash", ["-lc", cmd], { stdio: "pipe" });
 
@@ -556,7 +633,7 @@ test.describe("streaming /urls endpoint", () => {
     const sessionId = `e2e-loop-recover-${Date.now()}`;
     await page.goto(`/session/${sessionId}`);
     await expect(page.locator("#tab-list .tab-item")).toHaveCount(1, { timeout: 5000 });
-    const sharedKey = await getSharedKey(page);
+    const sharedKey = await getWriteKey(page);
 
     const { spawn } = await import("child_process");
     const curl = spawn("curl", ["-sN", `${BASE_URL}/session/${sessionId}/urls`], { stdio: "pipe" });

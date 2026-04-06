@@ -18,6 +18,7 @@
       font-family: 'IBM Plex Mono', monospace; background: var(--bg); color: var(--fg);
       display: flex; flex-direction: column; overflow: hidden; font-size: 15px;
     }
+    body.resizing-sidebar { cursor: col-resize; user-select: none; }
 
     .main { flex: 1; display: flex; min-height: 0; }
 
@@ -40,6 +41,9 @@
       display: flex; align-items: center; gap: 6px;
     }
     .sidebar-header button:hover { color: var(--fg); }
+    .sidebar-header button:disabled {
+      color: var(--fg-muted); opacity: 0.35; cursor: default;
+    }
     .tab-list { flex: 1; overflow-y: auto; }
     .tab-item {
       display: flex; align-items: center; gap: 8px; width: 100%;
@@ -79,6 +83,16 @@
       font-size: 11px; color: var(--fg-muted); line-height: 1.8;
     }
     .sidebar-footer kbd { color: var(--fg-dim); }
+    .sidebar-resizer {
+      width: 10px; flex-shrink: 0; cursor: col-resize; position: relative;
+      background: linear-gradient(180deg, transparent 0%, rgba(212,160,65,0.03) 100%);
+    }
+    .sidebar-resizer::before {
+      content: ''; position: absolute; top: 0; bottom: 0; left: 4px; width: 1px;
+      background: var(--border); transition: background 0.15s;
+    }
+    .sidebar-resizer:hover::before,
+    body.resizing-sidebar .sidebar-resizer::before { background: var(--active); }
 
     /* Terminal area */
     .workspace { flex: 1; position: relative; min-height: 0; }
@@ -113,6 +127,7 @@
     .waiting .hint {
       font-size: 12px; color: var(--fg-muted); margin-top: 6px; text-align: center; line-height: 1.7;
     }
+    .waiting.readonly .cmd-box { display: none; }
 
     .xterm { height: 100%; }
 
@@ -125,10 +140,12 @@
 </head>
 <body>
   <div class="main">
-    <div class="sidebar">
+    <div class="sidebar" id="sidebar">
       <div class="sidebar-header">
         <span>tabs</span>
         <div class="header-actions">
+          <button id="btn-copy-read" title="Copy read-only link">R</button>
+          <button id="btn-copy-write" title="Copy write link">W</button>
           <button id="btn-session" title="New session (clears stored state)">N</button>
           <button id="btn-new" title="Ctrl+Shift+N">+</button>
         </div>
@@ -140,6 +157,7 @@
         drag reorder · dblclick rename · * pin
       </div>
     </div>
+    <div class="sidebar-resizer" id="sidebar-resizer" title="Resize sidebar"></div>
 
     <div class="workspace" id="workspace"></div>
   </div>
@@ -153,7 +171,8 @@
     const sessionId = pathParts[pathParts.indexOf('session') + 1] || 'unknown';
     const SESSION_KEY = 'ttyd-session-id';
     const SESSION_PREFIX = 'ttyd-ui:';
-    const sharedKeyStorageKey = `${SESSION_PREFIX}key:${sessionId}`;
+    const writeKeyStorageKey = `${SESSION_PREFIX}write:${sessionId}`;
+    const legacySharedKeyStorageKey = `${SESSION_PREFIX}key:${sessionId}`;
     const origin = location.origin;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = location.host;
@@ -167,8 +186,11 @@
     const tabs = new Map();
     const storageKey = `ttyd-ui:${sessionId}`;
     const savedPrefs = loadTabPrefs();
-    const sharedKey = loadOrCreateSharedKey();
-    const sharedCryptoKeyPromise = importSharedCryptoKey(sharedKey);
+    const access = await initAccess();
+    const { canWrite, readKey, writeKey, readLink, writeLink } = access;
+    const readCryptoKeyPromise = importAesCryptoKey(readKey);
+    const writeCryptoKeyPromise = writeKey ? importAesCryptoKey(writeKey) : null;
+    let sidebarWidth = clampSidebarWidth(Number(savedPrefs.sidebarWidth) || 228);
     let tabOrder = Array.isArray(savedPrefs.order) ? savedPrefs.order : [];
     let activeTabId = null;
     let tabCounter = 0;
@@ -178,21 +200,33 @@
 
     const workspace = document.getElementById('workspace');
     const tabListEl = document.getElementById('tab-list');
+    const sidebarEl = document.getElementById('sidebar');
+    const sidebarResizerEl = document.getElementById('sidebar-resizer');
 
     function getTabId() { return `t${++tabCounter}`; }
+
+    function clampSidebarWidth(width) {
+      const maxWidth = Math.max(280, Math.min(520, window.innerWidth - 200));
+      return Math.max(180, Math.min(maxWidth, Math.round(width)));
+    }
+
+    function fitActiveTerminal() {
+      const e = activeTabId ? tabs.get(activeTabId) : null;
+      if (e?.fitAddon && e.connected) e.fitAddon.fit();
+    }
+
+    function applySidebarWidth() {
+      sidebarEl.style.width = `${sidebarWidth}px`;
+      fitActiveTerminal();
+    }
 
     function generateSessionId() {
       const bytes = crypto.getRandomValues(new Uint8Array(16));
       return bytesToBase64Url(bytes);
     }
 
-    function loadOrCreateSharedKey() {
-      const existing = localStorage.getItem(sharedKeyStorageKey);
-      if (existing) return existing;
-      const bytes = crypto.getRandomValues(new Uint8Array(32));
-      const encoded = bytesToBase64Url(bytes);
-      localStorage.setItem(sharedKeyStorageKey, encoded);
-      return encoded;
+    function generateRandomKey() {
+      return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
     }
 
     function bytesToBase64(bytes) {
@@ -218,7 +252,7 @@
       return base64ToBytes(padded);
     }
 
-    async function importSharedCryptoKey(base64url) {
+    async function importAesCryptoKey(base64url) {
       return crypto.subtle.importKey(
         'raw',
         base64UrlToBytes(base64url),
@@ -228,9 +262,79 @@
       );
     }
 
+    async function deriveReadKey(writeKeyBase64Url) {
+      // The visible URL carries only this derived read key. The write key stays
+      // client-local so casually copying the page URL shares read access by
+      // default, and possession of the read key alone does not let the relay or
+      // another viewer derive a valid write capability.
+      const hmacKey = await crypto.subtle.importKey(
+        'raw',
+        base64UrlToBytes(writeKeyBase64Url),
+        { name: 'HMAC', hash: 'SHA-256' },
+        false,
+        ['sign'],
+      );
+      const signature = new Uint8Array(await crypto.subtle.sign(
+        'HMAC',
+        hmacKey,
+        textEncoder.encode('ttyd-relay read key v1'),
+      ));
+      return bytesToBase64Url(signature);
+    }
+
+    async function initAccess() {
+      const hash = new URLSearchParams(location.hash.slice(1));
+      const readFromHash = hash.get('r');
+      const writeFromHash = hash.get('w');
+      let storedWriteKey = localStorage.getItem(writeKeyStorageKey) || localStorage.getItem(legacySharedKeyStorageKey);
+      let write = null;
+      let read = null;
+      let writable = false;
+
+      if (writeFromHash) {
+        write = writeFromHash;
+        read = await deriveReadKey(write);
+        writable = true;
+      } else if (readFromHash) {
+        read = readFromHash;
+        if (storedWriteKey) {
+          const derived = await deriveReadKey(storedWriteKey);
+          if (derived === read) {
+            write = storedWriteKey;
+            writable = true;
+          }
+        }
+      } else {
+        write = storedWriteKey || generateRandomKey();
+        read = await deriveReadKey(write);
+        writable = true;
+      }
+
+      if (write) {
+        localStorage.setItem(writeKeyStorageKey, write);
+        localStorage.removeItem(legacySharedKeyStorageKey);
+      }
+
+      const readHash = `#r=${read}`;
+      // Normalize every loaded URL back to #r=... so the address bar remains a
+      // read-only share link even when a writer opens a #w=... link locally.
+      if (location.hash !== readHash) history.replaceState(null, '', `${location.pathname}${location.search}${readHash}`);
+
+      return {
+        canWrite: writable,
+        readKey: read,
+        writeKey: write,
+        readLink: `${origin}${location.pathname}${location.search}${readHash}`,
+        writeLink: write ? `${origin}${location.pathname}${location.search}#w=${write}` : null,
+      };
+    }
+
     async function encryptPayload(bytes) {
       const iv = crypto.getRandomValues(new Uint8Array(12));
-      const key = await sharedCryptoKeyPromise;
+      // Viewer input and resize messages require the write key. If this page
+      // was opened from a plain read link, writeCryptoKeyPromise is null and
+      // the UI never attempts to send input.
+      const key = await writeCryptoKeyPromise;
       const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes));
       const payload = new Uint8Array(iv.length + cipher.length);
       payload.set(iv, 0);
@@ -242,7 +346,9 @@
       if (bytes.length < 12 + 16) throw new Error('encrypted payload too short');
       const iv = bytes.slice(0, 12);
       const cipher = bytes.slice(12);
-      const key = await sharedCryptoKeyPromise;
+      // Terminal output/title/prefs are decrypted with the derived read key so
+      // read-only links can still render the session.
+      const key = await readCryptoKeyPromise;
       return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher));
     }
 
@@ -267,7 +373,8 @@
     }
 
     function getConnectCmd() {
-      return `curl -sN ${origin}/session/${sessionId}/urls | while read -r _url; do ttyd --connect-shared-key ${sharedKey} --connect "$_url" -W "\${SHELL:-bash}" & done`;
+      if (!writeKey) return 'write link required';
+      return `curl -sN ${origin}/session/${sessionId}/urls | while read -r _url; do ttyd --connect-write-key ${writeKey} --connect "$_url" -W "\${SHELL:-bash}" & done`;
     }
 
     function loadTabPrefs() {
@@ -289,6 +396,7 @@
         order: tabOrder.filter((tabId) => tabs.has(tabId)),
         labels,
         pinned,
+        sidebarWidth,
       }));
     }
 
@@ -316,17 +424,21 @@
       if (!e) return;
       const hasExplicitTitle = e.title && e.title !== tabId;
       const label = e.customLabel
-        || (hasExplicitTitle && e.cwdLabel && e.cwdLabel !== e.title ? `${e.title} · ${e.cwdLabel}` : null)
-        || (hasExplicitTitle ? e.title : null)
+        || (e.cwdLabel && hasExplicitTitle && e.cwdLabel !== e.title ? `${e.cwdLabel} · ${e.title}` : null)
         || e.cwdLabel
+        || (hasExplicitTitle ? e.title : null)
         || e.title;
       e.tabBtn.querySelector('.tab-name').textContent = label;
       const tooltip = [];
       if (e.customLabel) tooltip.push(e.customLabel);
-      else if (hasExplicitTitle) tooltip.push(e.title);
       if (e.cwd) tooltip.push(e.cwd);
+      if (hasExplicitTitle) tooltip.push(e.title);
       e.tabBtn.title = tooltip.length > 0 ? tooltip.join('\n') : label;
       if (activeTabId === tabId) document.title = `ttyd · ${label}`;
+    }
+
+    function normalizeTerminalTitle(title) {
+      return title.replace(/^\/usr\/bin\//, '').replace(/^\/bin\//, '');
     }
 
     function getCwdLabel(cwd) {
@@ -422,7 +534,7 @@
 
       const waiting = document.createElement('div');
       waiting.className = 'waiting';
-      waiting.innerHTML = `
+      waiting.innerHTML = canWrite ? `
         <div class="label">run this once in another terminal</div>
         <div class="cmd-box">
           <span class="prompt">$</span>
@@ -430,6 +542,9 @@
           <button class="copy-btn">copy</button>
         </div>
         <div class="hint">leave it running; the first shell should start automatically, then use Ctrl+Shift+N for more</div>
+      ` : `
+        <div class="label">read-only link</div>
+        <div class="hint">this link can read terminal output but cannot start terminals or send input. ask for a write link to control this session.</div>
       `;
       pane.appendChild(waiting);
 
@@ -442,12 +557,16 @@
 
       const cmd = getConnectCmd();
       pane.dataset.wsUrl = getConnectUrl(tabId);
-      pane.querySelector('.cmd').textContent = cmd;
-      pane.querySelector('.copy-btn').addEventListener('click', function() {
-        navigator.clipboard.writeText(cmd);
-        this.textContent = '✓'; this.classList.add('flash');
-        setTimeout(() => { this.textContent = 'copy'; this.classList.remove('flash'); }, 1500);
-      });
+      const cmdEl = pane.querySelector('.cmd');
+      const copyBtnEl = pane.querySelector('.copy-btn');
+      if (cmdEl && copyBtnEl) {
+        cmdEl.textContent = cmd;
+        copyBtnEl.addEventListener('click', function() {
+          navigator.clipboard.writeText(cmd);
+          this.textContent = '✓'; this.classList.add('flash');
+          setTimeout(() => { this.textContent = 'copy'; this.classList.remove('flash'); }, 1500);
+        });
+      }
 
       const tabBtn = document.createElement('button');
       tabBtn.className = 'tab-item';
@@ -538,7 +657,7 @@
 
     function requestTabConnection(tabId) {
       const e = tabs.get(tabId);
-      if (!e || e.connected || e.requested || viewerWs?.readyState !== WebSocket.OPEN) return;
+      if (!canWrite || !e || e.connected || e.requested || viewerWs?.readyState !== WebSocket.OPEN) return;
       viewerWs.send(JSON.stringify({ type: 'new_tab', tab: tabId }));
       e.requested = true;
     }
@@ -548,6 +667,7 @@
     }
 
     function createTab() {
+      if (!canWrite) return null;
       const tabId = getTabId();
       ensureTab(tabId, false);
       activateTab(tabId);
@@ -587,7 +707,7 @@
     function setTabTitle(tabId, title) {
       const e = tabs.get(tabId);
       if (!e) return;
-      e.title = title;
+      e.title = normalizeTerminalTitle(title);
       updateTabLabel(tabId);
     }
 
@@ -611,6 +731,7 @@
         e.xtermWrap.style.display = '';
 
         const terminal = new Terminal({
+          disableStdin: !canWrite,
           cursorBlink: true, fontSize: 14, lineHeight: 1.15,
           fontFamily: "'IBM Plex Mono', monospace",
           theme: { background: '#000', foreground: '#d4a041', cursor: '#ffcc33', selectionBackground: '#3a2a00' },
@@ -623,32 +744,36 @@
         const ro = new ResizeObserver(() => { if (e.pane.classList.contains('active')) fitAddon.fit(); });
         ro.observe(e.xtermWrap);
 
-        terminal.onData(data => {
-          void queueViewerSend(async () => {
-            if (!viewerWs || viewerWs.readyState !== WebSocket.OPEN) return;
-            const encrypted = await encryptPayload(textEncoder.encode(data));
-            viewerWs.send(JSON.stringify({ type: 'input', tab: tabId, data: bytesToBase64(encrypted) }));
+        if (canWrite) {
+          terminal.onData(data => {
+            void queueViewerSend(async () => {
+              if (!viewerWs || viewerWs.readyState !== WebSocket.OPEN) return;
+              const encrypted = await encryptPayload(textEncoder.encode(data));
+              viewerWs.send(JSON.stringify({ type: 'input', tab: tabId, data: bytesToBase64(encrypted) }));
+            });
           });
-        });
 
-        terminal.onResize(({ cols, rows }) => {
-          void queueViewerSend(async () => {
-            if (viewerWs?.readyState !== WebSocket.OPEN) return;
-            const payload = textEncoder.encode(JSON.stringify({ columns: cols, rows }));
-            const encrypted = await encryptPayload(payload);
-            viewerWs.send(JSON.stringify({ type: 'resize', tab: tabId, data: bytesToBase64(encrypted), cols, rows }));
+          terminal.onResize(({ cols, rows }) => {
+            void queueViewerSend(async () => {
+              if (viewerWs?.readyState !== WebSocket.OPEN) return;
+              const payload = textEncoder.encode(JSON.stringify({ columns: cols, rows }));
+              const encrypted = await encryptPayload(payload);
+              viewerWs.send(JSON.stringify({ type: 'resize', tab: tabId, data: bytesToBase64(encrypted), cols, rows }));
+            });
           });
-        });
+        }
 
         terminal.onTitleChange(title => { if (title) setTabTitle(tabId, title); });
         terminal.onBell(() => triggerBell(tabId));
 
-        void queueViewerSend(async () => {
-          if (viewerWs?.readyState !== WebSocket.OPEN) return;
-          const payload = textEncoder.encode(JSON.stringify({ columns: terminal.cols, rows: terminal.rows }));
-          const encrypted = await encryptPayload(payload);
-          viewerWs.send(JSON.stringify({ type: 'resize', tab: tabId, data: bytesToBase64(encrypted), cols: terminal.cols, rows: terminal.rows }));
-        });
+        if (canWrite) {
+          void queueViewerSend(async () => {
+            if (viewerWs?.readyState !== WebSocket.OPEN) return;
+            const payload = textEncoder.encode(JSON.stringify({ columns: terminal.cols, rows: terminal.rows }));
+            const encrypted = await encryptPayload(payload);
+            viewerWs.send(JSON.stringify({ type: 'resize', tab: tabId, data: bytesToBase64(encrypted), cols: terminal.cols, rows: terminal.rows }));
+          });
+        }
 
         e.terminal = terminal;
         e.fitAddon = fitAddon;
@@ -674,7 +799,7 @@
       viewerWs = new WebSocket(url);
 
       viewerWs.addEventListener('open', () => {
-        requestPendingTabs();
+        if (canWrite) requestPendingTabs();
       });
 
       viewerWs.addEventListener('message', (ev) => {
@@ -719,8 +844,8 @@
     document.addEventListener('keydown', (e) => {
       if (!e.ctrlKey || !e.shiftKey) return;
       switch (e.key) {
-        case 'N': e.preventDefault(); createTab(); break;
-        case 'W': e.preventDefault(); if (activeTabId) removeTab(activeTabId); break;
+        case 'N': if (!canWrite) return; e.preventDefault(); createTab(); break;
+        case 'W': if (!canWrite) return; e.preventDefault(); if (activeTabId) removeTab(activeTabId); break;
         case ']': e.preventDefault(); cycleTabs(1); break;
         case '[': e.preventDefault(); cycleTabs(-1); break;
       }
@@ -739,14 +864,62 @@
       activateTab(ids[(ci + dir + ids.length) % ids.length]);
     }
 
+    function startSidebarResize(ev) {
+      ev.preventDefault();
+      document.body.classList.add('resizing-sidebar');
+      const move = (moveEv) => {
+        sidebarWidth = clampSidebarWidth(moveEv.clientX);
+        applySidebarWidth();
+      };
+      const stop = () => {
+        document.body.classList.remove('resizing-sidebar');
+        window.removeEventListener('mousemove', move);
+        window.removeEventListener('mouseup', stop);
+        saveTabPrefs();
+      };
+      window.addEventListener('mousemove', move);
+      window.addEventListener('mouseup', stop);
+    }
+
+    function flashButton(btn, readyText) {
+      const prev = btn.textContent;
+      btn.textContent = readyText;
+      btn.classList.add('flash');
+      setTimeout(() => {
+        btn.textContent = prev;
+        btn.classList.remove('flash');
+      }, 1200);
+    }
+
     document.getElementById('btn-new').addEventListener('click', () => createTab());
     document.getElementById('btn-session').addEventListener('click', () => {
       clearStoredState();
       location.href = `/session/${generateSessionId()}`;
     });
+    document.getElementById('btn-copy-read').addEventListener('click', async (ev) => {
+      await navigator.clipboard.writeText(readLink);
+      flashButton(ev.currentTarget, '✓');
+    });
+    document.getElementById('btn-copy-write').addEventListener('click', async (ev) => {
+      if (!writeLink) return;
+      await navigator.clipboard.writeText(writeLink);
+      flashButton(ev.currentTarget, '✓');
+    });
+    sidebarResizerEl.addEventListener('mousedown', startSidebarResize);
+    window.addEventListener('resize', () => {
+      const nextWidth = clampSidebarWidth(sidebarWidth);
+      if (nextWidth !== sidebarWidth) {
+        sidebarWidth = nextWidth;
+        saveTabPrefs();
+      }
+      applySidebarWidth();
+    });
 
     // Start: create one empty tab and connect viewer
-    createTab();
+    applySidebarWidth();
+    document.getElementById('btn-new').disabled = !canWrite;
+    document.getElementById('btn-copy-write').disabled = !writeLink;
+    if (canWrite) createTab();
     connectViewer();
   </script>
 </body>

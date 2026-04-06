@@ -24,12 +24,12 @@ static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
 #define CONNECT_TAG_LEN 16
 #endif
 
-static bool use_connect_shared_key(void) {
-  return server->connect_url != NULL && server->connect_shared_key_enabled;
+static bool use_connect_keys(void) {
+  return server->connect_url != NULL && server->connect_keys_enabled;
 }
 
 #ifdef TTYD_OPENSSL_CRYPTO
-static int encrypt_connect_payload(const unsigned char *plaintext, size_t plaintext_len,
+static int encrypt_connect_payload(const unsigned char key[32], const unsigned char *plaintext, size_t plaintext_len,
                                    unsigned char **ciphertext, size_t *ciphertext_len) {
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (ctx == NULL) return -1;
@@ -46,7 +46,7 @@ static int encrypt_connect_payload(const unsigned char *plaintext, size_t plaint
   if (RAND_bytes(nonce, CONNECT_NONCE_LEN) != 1) goto done;
   if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto done;
   if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, CONNECT_NONCE_LEN, NULL) != 1) goto done;
-  if (EVP_EncryptInit_ex(ctx, NULL, NULL, server->connect_shared_key, nonce) != 1) goto done;
+  if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto done;
   if (plaintext_len > 0 &&
       EVP_EncryptUpdate(ctx, body, &out_len, plaintext, (int) plaintext_len) != 1) goto done;
   if (EVP_EncryptFinal_ex(ctx, body + out_len, &final_len) != 1) goto done;
@@ -65,7 +65,7 @@ done:
   return 0;
 }
 
-static int decrypt_connect_payload(const unsigned char *ciphertext, size_t ciphertext_len,
+static int decrypt_connect_payload(const unsigned char key[32], const unsigned char *ciphertext, size_t ciphertext_len,
                                    unsigned char **plaintext, size_t *plaintext_len) {
   if (ciphertext_len < CONNECT_NONCE_LEN + CONNECT_TAG_LEN) return -1;
 
@@ -85,7 +85,7 @@ static int decrypt_connect_payload(const unsigned char *ciphertext, size_t ciphe
 
   if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto done;
   if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, CONNECT_NONCE_LEN, NULL) != 1) goto done;
-  if (EVP_DecryptInit_ex(ctx, NULL, NULL, server->connect_shared_key, nonce) != 1) goto done;
+  if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto done;
   if (body_len > 0 && EVP_DecryptUpdate(ctx, *plaintext, &out_len, body, (int) body_len) != 1) goto done;
   if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, CONNECT_TAG_LEN, (void *) tag) != 1) goto done;
   if (EVP_DecryptFinal_ex(ctx, *plaintext + out_len, &final_len) != 1) goto done;
@@ -109,8 +109,11 @@ static int write_command_message(struct lws *wsi, char command, const unsigned c
   size_t encoded_len = payload_len;
 #ifdef TTYD_OPENSSL_CRYPTO
   unsigned char *encrypted = NULL;
-  if (use_connect_shared_key()) {
-    if (encrypt_connect_payload(payload, payload_len, &encrypted, &encoded_len) != 0) {
+  if (use_connect_keys()) {
+    // Outbound ttyd data is encrypted with the derived read key so a browser
+    // holding only the read capability can render output but still cannot send
+    // valid input back into ttyd.
+    if (encrypt_connect_payload(server->connect_read_key, payload, payload_len, &encrypted, &encoded_len) != 0) {
       lwsl_err("failed to encrypt outbound payload\n");
       return -1;
     }
@@ -366,8 +369,11 @@ static int handle_command(struct pss_tty *pss) {
   size_t payload_len = pss->len - 1;
 #ifdef TTYD_OPENSSL_CRYPTO
   unsigned char *decrypted = NULL;
-  if (use_connect_shared_key()) {
-    if (decrypt_connect_payload(payload, payload_len, &decrypted, &payload_len) != 0) {
+  if (use_connect_keys()) {
+    // Inbound viewer data is accepted only under the write key. The relay can
+    // forward ciphertext, but cannot upgrade a read-only capability into a
+    // writer because ttyd itself enforces the split here.
+    if (decrypt_connect_payload(server->connect_write_key, payload, payload_len, &decrypted, &payload_len) != 0) {
       lwsl_err("failed to decrypt inbound payload\n");
       return -1;
     }
