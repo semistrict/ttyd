@@ -12,10 +12,31 @@
 
 const { WebSocketServer } = require('ws');
 const { spawn } = require('child_process');
+const { createCipheriv, createDecipheriv, randomBytes } = require('crypto');
 const path = require('path');
 
 const TTYD = process.argv[2] || path.join(__dirname, '..', 'build', 'ttyd');
 const PORT = 0; // let the OS pick a free port
+const SHARED_KEY = randomBytes(32);
+const SHARED_KEY_ARG = SHARED_KEY.toString('base64url');
+
+function encryptPayload(plaintext) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', SHARED_KEY, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, ciphertext, tag]);
+}
+
+function decryptPayload(payload) {
+  if (payload.length < 28) throw new Error('encrypted payload too short');
+  const iv = payload.subarray(0, 12);
+  const ciphertext = payload.subarray(12, payload.length - 16);
+  const tag = payload.subarray(payload.length - 16);
+  const decipher = createDecipheriv('aes-256-gcm', SHARED_KEY, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
 
 function startServer() {
   return new Promise((resolve) => {
@@ -43,6 +64,7 @@ function runTest(wss, port) {
       gotPrefs: false,
       gotOutput: false,
       inputEchoed: false,
+      payloadsEncrypted: true,
       cleanClose: false,
     };
 
@@ -53,7 +75,15 @@ function runTest(wss, port) {
       ws.on('message', (data) => {
         const buf = Buffer.from(data);
         const cmd = String.fromCharCode(buf[0]);
-        const payload = buf.slice(1).toString();
+        const rawPayload = buf.slice(1);
+        let payload;
+        try {
+          payload = decryptPayload(rawPayload).toString();
+        } catch (err) {
+          clearTimeout(timeout);
+          reject(err);
+          return;
+        }
 
         switch (cmd) {
           case '1': // SET_WINDOW_TITLE
@@ -64,6 +94,9 @@ function runTest(wss, port) {
             break;
           case '0': // OUTPUT
             results.gotOutput = true;
+            if (rawPayload.includes(Buffer.from('OUTBOUND_TEST_OK'))) {
+              results.payloadsEncrypted = false;
+            }
             if (payload.includes('OUTBOUND_TEST_OK')) {
               results.inputEchoed = true;
             }
@@ -72,15 +105,17 @@ function runTest(wss, port) {
             if (!sentInput) {
               sentInput = true;
               const input = 'echo OUTBOUND_TEST_OK\n';
-              const msg = Buffer.alloc(1 + input.length);
+              const encrypted = encryptPayload(Buffer.from(input));
+              const msg = Buffer.alloc(1 + encrypted.length);
               msg[0] = '0'.charCodeAt(0); // INPUT
-              msg.write(input, 1);
+              encrypted.copy(msg, 1);
               ws.send(msg);
 
               setTimeout(() => {
-                const exitMsg = Buffer.alloc(1 + 5);
+                const exitPayload = encryptPayload(Buffer.from('exit\n'));
+                const exitMsg = Buffer.alloc(1 + exitPayload.length);
                 exitMsg[0] = '0'.charCodeAt(0);
-                exitMsg.write('exit\n', 1);
+                exitPayload.copy(exitMsg, 1);
                 ws.send(exitMsg);
               }, 500);
             }
@@ -96,7 +131,7 @@ function runTest(wss, port) {
     });
 
     // Launch ttyd in client mode
-    const ttyd = spawn(TTYD, ['--connect', `ws://localhost:${port}`, '-W', 'bash'], {
+    const ttyd = spawn(TTYD, ['--connect-shared-key', SHARED_KEY_ARG, '--connect', `ws://localhost:${port}`, '-W', 'bash'], {
       stdio: 'ignore',
     });
 
@@ -121,6 +156,7 @@ async function main() {
       ['SET_PREFERENCES received', results.gotPrefs],
       ['OUTPUT received', results.gotOutput],
       ['Remote input echoed back', results.inputEchoed],
+      ['Wire payloads encrypted', results.payloadsEncrypted],
       ['Clean disconnect (code 1000)', results.cleanClose],
     ];
 

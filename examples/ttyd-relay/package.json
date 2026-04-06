@@ -1,0 +1,23 @@
+{
+  "name": "ttyd-relay",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "vite": "^8.0.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.31.0",
+    "@cloudflare/workers-types": "^4.20260405.1",
+    "@playwright/test": "^1.59.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^6.0.2",
+    "wrangler": "^4.80.0",
+    "ws": "^8.20.0"
+  }
+}

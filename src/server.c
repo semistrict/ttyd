@@ -11,6 +11,10 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#ifdef TTYD_OPENSSL_CRYPTO
+#include <openssl/evp.h>
+#endif
+
 #include "utils.h"
 #include "compat.h"
 
@@ -87,6 +91,7 @@ static const struct option options[] = {{"port", required_argument, NULL, 'p'},
                                         {"exit-no-conn", no_argument, NULL, 'q'},
                                         {"browser", no_argument, NULL, 'B'},
                                         {"connect", required_argument, NULL, 256},
+                                        {"connect-shared-key", required_argument, NULL, 257},
                                         {"debug", required_argument, NULL, 'd'},
                                         {"version", no_argument, NULL, 'v'},
                                         {"help", no_argument, NULL, 'h'},
@@ -136,6 +141,8 @@ static void print_help() {
 #endif
           "        --connect            Connect to a remote WebSocket URL instead of listening (client mode,\n"
           "                               eg: ws://host:port/path or wss://host:port/path)\n"
+          "        --connect-shared-key Base64url-encoded 32-byte key for local-only payload encryption in\n"
+          "                               --connect mode. The key is never sent over the websocket.\n"
           "    -d, --debug             Set log level (default: 7)\n"
           "    -v, --version           Print the version and exit\n"
           "    -h, --help              Print this text and exit\n\n"
@@ -159,6 +166,7 @@ static void print_config() {
     lwsl_notice("  websocket: %s\n", endpoints.ws);
   }
   if (server->connect_url != NULL) lwsl_notice("  connect URL: %s\n", server->connect_url);
+  if (server->connect_shared_key_enabled) lwsl_notice("  connect payload encryption: true\n");
   if (server->auth_header != NULL) lwsl_notice("  auth header: %s\n", server->auth_header);
   if (server->check_origin) lwsl_notice("  check origin: true\n");
   if (server->url_arg) lwsl_notice("  allow url arg: true\n");
@@ -272,6 +280,57 @@ static int parse_int(char *name, char *str) {
     exit(EXIT_FAILURE);
   }
   return (int)val;
+}
+
+static int parse_connect_shared_key(const char *encoded, unsigned char out[32]) {
+#ifndef TTYD_OPENSSL_CRYPTO
+  (void)encoded;
+  (void)out;
+  fprintf(stderr, "ttyd: --connect-shared-key requires an OpenSSL-enabled build\n");
+  return -1;
+#else
+  size_t input_len = strlen(encoded);
+  if (input_len == 0 || input_len > 64) {
+    fprintf(stderr, "ttyd: invalid --connect-shared-key length\n");
+    return -1;
+  }
+
+  size_t standard_len = input_len;
+  size_t remainder = standard_len % 4;
+  if (remainder != 0) standard_len += 4 - remainder;
+  char *standard = xmalloc(standard_len + 1);
+  for (size_t i = 0; i < input_len; i++) {
+    char ch = encoded[i];
+    if (ch == '-') ch = '+';
+    else if (ch == '_') ch = '/';
+    standard[i] = ch;
+  }
+  for (size_t i = input_len; i < standard_len; i++) standard[i] = '=';
+  standard[standard_len] = '\0';
+
+  unsigned char decoded[48];
+  int decoded_len = EVP_DecodeBlock(decoded, (const unsigned char *)standard, (int)standard_len);
+  free(standard);
+  if (decoded_len < 0) {
+    fprintf(stderr, "ttyd: invalid --connect-shared-key encoding\n");
+    return -1;
+  }
+
+  int padding = 0;
+  if (standard_len >= 1 && encoded[input_len - 1] != '=') {
+    size_t mod = input_len % 4;
+    if (mod == 2) padding = 2;
+    else if (mod == 3) padding = 1;
+  }
+  decoded_len -= padding;
+  if (decoded_len != 32) {
+    fprintf(stderr, "ttyd: --connect-shared-key must decode to exactly 32 bytes\n");
+    return -1;
+  }
+
+  memcpy(out, decoded, 32);
+  return 0;
+#endif
 }
 
 static int calc_command_start(int argc, char **argv) {
@@ -512,6 +571,10 @@ int main(int argc, char **argv) {
       case 256:
         server->connect_url = strdup(optarg);
         break;
+      case 257:
+        if (parse_connect_shared_key(optarg, server->connect_shared_key) != 0) return -1;
+        server->connect_shared_key_enabled = true;
+        break;
       case '?':
         break;
       case 't':
@@ -542,6 +605,10 @@ int main(int argc, char **argv) {
 
   if (server->command == NULL || strlen(server->command) == 0) {
     fprintf(stderr, "ttyd: missing start command\n");
+    return -1;
+  }
+  if (server->connect_shared_key_enabled && server->connect_url == NULL) {
+    fprintf(stderr, "ttyd: --connect-shared-key requires --connect\n");
     return -1;
   }
 
@@ -648,7 +715,7 @@ int main(int argc, char **argv) {
 
     bool use_ssl = (strcmp(prot, "wss") == 0 || strcmp(prot, "https") == 0);
     if (use_ssl) {
-      ccinfo.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+      ccinfo.ssl_connection = LCCSCF_USE_SSL;
     }
 
     if (lws_client_connect_via_info(&ccinfo) == NULL) {

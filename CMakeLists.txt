@@ -83,6 +83,7 @@ if(LWS_OPENSSL_ENABLED AND NOT LWS_MBEDTLS_ENABLED)
     find_package(OpenSSL REQUIRED)
     list(APPEND INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
     list(APPEND LINK_LIBS ${OPENSSL_LIBRARIES})
+    add_compile_definitions(TTYD_OPENSSL_CRYPTO=1)
 endif()
 
 if(WIN32)
@@ -117,7 +118,10 @@ target_compile_definitions(${PROJECT_NAME} PUBLIC
 
 enable_testing()
 add_test(NAME outbound-websocket
-    COMMAND node ${CMAKE_SOURCE_DIR}/test/test-outbound.js $<TARGET_FILE:${PROJECT_NAME}>
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_DIR=${CMAKE_SOURCE_DIR}/test
+        -DTTYD_BINARY=$<TARGET_FILE:${PROJECT_NAME}>
+        -P ${CMAKE_SOURCE_DIR}/cmake/run_outbound_test.cmake
 )
 
 if(NOT MSVC)
@@ -136,14 +140,13 @@ if(NOT MSVC)
     )
     set_target_properties(${PROJECT_NAME}-sanitized PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
-    add_test(NAME outbound-websocket-sanitized
-        COMMAND node ${CMAKE_SOURCE_DIR}/test/test-outbound.js $<TARGET_FILE:${PROJECT_NAME}-sanitized>
-    )
-
     # make test-sanitized: build + run tests under ASan/UBSan
     add_custom_target(test-sanitized
         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${PROJECT_NAME}-sanitized
-        COMMAND ${CMAKE_CTEST_COMMAND} -R sanitized --output-on-failure
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_DIR=${CMAKE_SOURCE_DIR}/test
+            -DTTYD_BINARY=$<TARGET_FILE:${PROJECT_NAME}-sanitized>
+            -P ${CMAKE_SOURCE_DIR}/cmake/run_outbound_test.cmake
         DEPENDS ${PROJECT_NAME}-sanitized
         COMMENT "Running tests with AddressSanitizer + UndefinedBehaviorSanitizer"
     )
