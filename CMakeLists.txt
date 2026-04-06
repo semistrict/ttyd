@@ -83,6 +83,7 @@ if(LWS_OPENSSL_ENABLED AND NOT LWS_MBEDTLS_ENABLED)
     find_package(OpenSSL REQUIRED)
     list(APPEND INCLUDE_DIRS ${OPENSSL_INCLUDE_DIR})
     list(APPEND LINK_LIBS ${OPENSSL_LIBRARIES})
+    add_compile_definitions(TTYD_OPENSSL_CRYPTO=1)
 endif()
 
 if(WIN32)
@@ -114,6 +115,42 @@ target_compile_definitions(${PROJECT_NAME} PUBLIC
     TTYD_VERSION="${TTYD_VERSION}"
     $<$<PLATFORM_ID:Windows>:_WIN32_WINNT=0xa00 WINVER=0xa00>
 )
+
+enable_testing()
+add_test(NAME outbound-websocket
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_DIR=${CMAKE_SOURCE_DIR}/test
+        -DTTYD_BINARY=$<TARGET_FILE:${PROJECT_NAME}>
+        -P ${CMAKE_SOURCE_DIR}/cmake/run_outbound_test.cmake
+)
+
+if(NOT MSVC)
+    # Sanitized build: separate executable with ASan + UBSan
+    add_executable(${PROJECT_NAME}-sanitized ${SOURCE_FILES})
+    target_include_directories(${PROJECT_NAME}-sanitized PUBLIC ${INCLUDE_DIRS})
+    target_link_libraries(${PROJECT_NAME}-sanitized ${LINK_LIBS})
+    target_compile_definitions(${PROJECT_NAME}-sanitized PUBLIC
+        TTYD_VERSION="${TTYD_VERSION}"
+    )
+    target_compile_options(${PROJECT_NAME}-sanitized PRIVATE
+        -fsanitize=address,undefined -fno-omit-frame-pointer -g
+    )
+    target_link_options(${PROJECT_NAME}-sanitized PRIVATE
+        -fsanitize=address,undefined
+    )
+    set_target_properties(${PROJECT_NAME}-sanitized PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    # make test-sanitized: build + run tests under ASan/UBSan
+    add_custom_target(test-sanitized
+        COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${PROJECT_NAME}-sanitized
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_DIR=${CMAKE_SOURCE_DIR}/test
+            -DTTYD_BINARY=$<TARGET_FILE:${PROJECT_NAME}-sanitized>
+            -P ${CMAKE_SOURCE_DIR}/cmake/run_outbound_test.cmake
+        DEPENDS ${PROJECT_NAME}-sanitized
+        COMMENT "Running tests with AddressSanitizer + UndefinedBehaviorSanitizer"
+    )
+endif()
 
 include(GNUInstallDirs)
 

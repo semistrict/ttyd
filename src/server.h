@@ -82,6 +82,9 @@ struct server {
   char socket_path[255];   // UNIX domain socket path
   char terminal_type[30];  // terminal type to report
   char *connect_url;       // outbound websocket URL (client mode)
+  bool connect_keys_enabled;  // encrypt outbound client payloads locally
+  unsigned char connect_write_key[32];
+  unsigned char connect_read_key[32];
 
   uv_loop_t *loop;         // the libuv event loop
 };

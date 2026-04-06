@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.output/
+.vinxi/
+.wrangler/
+test-results/
+*.local

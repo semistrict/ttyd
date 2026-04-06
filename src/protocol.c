@@ -6,6 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TTYD_OPENSSL_CRYPTO
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#endif
+
 #include "pty.h"
 #include "server.h"
 #include "utils.h"
@@ -14,26 +19,146 @@
 // initial message list
 static char initial_cmds[] = {SET_WINDOW_TITLE, SET_PREFERENCES};
 
+#ifdef TTYD_OPENSSL_CRYPTO
+#define CONNECT_NONCE_LEN 12
+#define CONNECT_TAG_LEN 16
+#endif
+
+static bool use_connect_keys(void) {
+  return server->connect_url != NULL && server->connect_keys_enabled;
+}
+
+#ifdef TTYD_OPENSSL_CRYPTO
+static int encrypt_connect_payload(const unsigned char key[32], const unsigned char *plaintext, size_t plaintext_len,
+                                   unsigned char **ciphertext, size_t *ciphertext_len) {
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (ctx == NULL) return -1;
+
+  *ciphertext_len = CONNECT_NONCE_LEN + plaintext_len + CONNECT_TAG_LEN;
+  *ciphertext = xmalloc(*ciphertext_len);
+  unsigned char *nonce = *ciphertext;
+  unsigned char *body = *ciphertext + CONNECT_NONCE_LEN;
+  unsigned char *tag = *ciphertext + CONNECT_NONCE_LEN + plaintext_len;
+  int out_len = 0;
+  int final_len = 0;
+  int ok = 0;
+
+  if (RAND_bytes(nonce, CONNECT_NONCE_LEN) != 1) goto done;
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto done;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, CONNECT_NONCE_LEN, NULL) != 1) goto done;
+  if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto done;
+  if (plaintext_len > 0 &&
+      EVP_EncryptUpdate(ctx, body, &out_len, plaintext, (int) plaintext_len) != 1) goto done;
+  if (EVP_EncryptFinal_ex(ctx, body + out_len, &final_len) != 1) goto done;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, CONNECT_TAG_LEN, tag) != 1) goto done;
+  *ciphertext_len = CONNECT_NONCE_LEN + (size_t)(out_len + final_len) + CONNECT_TAG_LEN;
+  ok = 1;
+
+done:
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) {
+    free(*ciphertext);
+    *ciphertext = NULL;
+    *ciphertext_len = 0;
+    return -1;
+  }
+  return 0;
+}
+
+static int decrypt_connect_payload(const unsigned char key[32], const unsigned char *ciphertext, size_t ciphertext_len,
+                                   unsigned char **plaintext, size_t *plaintext_len) {
+  if (ciphertext_len < CONNECT_NONCE_LEN + CONNECT_TAG_LEN) return -1;
+
+  size_t body_len = ciphertext_len - CONNECT_NONCE_LEN - CONNECT_TAG_LEN;
+  const unsigned char *nonce = ciphertext;
+  const unsigned char *body = ciphertext + CONNECT_NONCE_LEN;
+  const unsigned char *tag = ciphertext + CONNECT_NONCE_LEN + body_len;
+
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (ctx == NULL) return -1;
+
+  *plaintext = xmalloc(body_len > 0 ? body_len : 1);
+  *plaintext_len = body_len;
+  int out_len = 0;
+  int final_len = 0;
+  int ok = 0;
+
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto done;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, CONNECT_NONCE_LEN, NULL) != 1) goto done;
+  if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) goto done;
+  if (body_len > 0 && EVP_DecryptUpdate(ctx, *plaintext, &out_len, body, (int) body_len) != 1) goto done;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, CONNECT_TAG_LEN, (void *) tag) != 1) goto done;
+  if (EVP_DecryptFinal_ex(ctx, *plaintext + out_len, &final_len) != 1) goto done;
+  *plaintext_len = (size_t)(out_len + final_len);
+  ok = 1;
+
+done:
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) {
+    free(*plaintext);
+    *plaintext = NULL;
+    *plaintext_len = 0;
+    return -1;
+  }
+  return 0;
+}
+#endif
+
+static int write_command_message(struct lws *wsi, char command, const unsigned char *payload, size_t payload_len) {
+  unsigned char *encoded = (unsigned char *) payload;
+  size_t encoded_len = payload_len;
+#ifdef TTYD_OPENSSL_CRYPTO
+  unsigned char *encrypted = NULL;
+  if (use_connect_keys()) {
+    // Outbound ttyd data is encrypted with the derived read key so a browser
+    // holding only the read capability can render output but still cannot send
+    // valid input back into ttyd.
+    if (encrypt_connect_payload(server->connect_read_key, payload, payload_len, &encrypted, &encoded_len) != 0) {
+      lwsl_err("failed to encrypt outbound payload\n");
+      return -1;
+    }
+    encoded = encrypted;
+  }
+#endif
+
+  unsigned char *message = xmalloc(LWS_PRE + 1 + encoded_len);
+  unsigned char *ptr = message + LWS_PRE;
+  ptr[0] = (unsigned char) command;
+  if (encoded_len > 0) memcpy(ptr + 1, encoded, encoded_len);
+  size_t n = 1 + encoded_len;
+  int rc = lws_write(wsi, ptr, n, LWS_WRITE_BINARY);
+
+  free(message);
+#ifdef TTYD_OPENSSL_CRYPTO
+  if (encrypted != NULL) free(encrypted);
+#endif
+  return rc < (int) n ? -1 : 0;
+}
+
 static int send_initial_message(struct lws *wsi, int index) {
-  unsigned char message[LWS_PRE + 1 + 4096];
-  unsigned char *p = &message[LWS_PRE];
-  char buffer[128];
-  int n = 0;
+  char buffer[4096];
+  char hostname[128];
+  const unsigned char *payload = NULL;
+  size_t payload_len = 0;
 
   char cmd = initial_cmds[index];
   switch (cmd) {
     case SET_WINDOW_TITLE:
-      gethostname(buffer, sizeof(buffer) - 1);
-      n = snprintf((char *)p, 1 + 4096, "%c%s (%s)", cmd, server->command, buffer);
+      gethostname(hostname, sizeof(hostname) - 1);
+      hostname[sizeof(hostname) - 1] = '\0';
+      snprintf(buffer, sizeof(buffer), "%s (%s)", server->command, hostname);
+      payload = (const unsigned char *) buffer;
+      payload_len = strlen(buffer);
       break;
     case SET_PREFERENCES:
-      n = snprintf((char *)p, 1 + 4096, "%c%s", cmd, server->prefs_json);
+      payload = (const unsigned char *) server->prefs_json;
+      payload_len = strlen(server->prefs_json);
       break;
     default:
       break;
   }
 
-  return lws_write(wsi, p, (size_t)n, LWS_WRITE_BINARY);
+  return write_command_message(wsi, cmd, payload, payload_len);
 }
 
 static json_object *parse_window_size(const char *buf, size_t len, uint16_t *cols, uint16_t *rows) {
@@ -170,18 +295,9 @@ static bool spawn_process(struct pss_tty *pss, uint16_t columns, uint16_t rows) 
 
 static void wsi_output(struct lws *wsi, pty_buf_t *buf) {
   if (buf == NULL) return;
-  char *message = xmalloc(LWS_PRE + 1 + buf->len);
-  char *ptr = message + LWS_PRE;
-
-  *ptr = OUTPUT;
-  memcpy(ptr + 1, buf->base, buf->len);
-  size_t n = buf->len + 1;
-
-  if (lws_write(wsi, (unsigned char *)ptr, n, LWS_WRITE_BINARY) < n) {
+  if (write_command_message(wsi, OUTPUT, (const unsigned char *) buf->base, buf->len) != 0) {
     lwsl_err("write OUTPUT to WS\n");
   }
-
-  free(message);
 }
 
 static bool check_auth(struct lws *wsi, struct pss_tty *pss) {
@@ -249,33 +365,57 @@ static bool receive_append(struct pss_tty *pss, struct lws *wsi, void *in, size_
 // Returns: 0 = handled, 1 = unknown command, -1 = error.
 static int handle_command(struct pss_tty *pss) {
   const char command = pss->buffer[0];
+  const unsigned char *payload = (const unsigned char *)pss->buffer + 1;
+  size_t payload_len = pss->len - 1;
+#ifdef TTYD_OPENSSL_CRYPTO
+  unsigned char *decrypted = NULL;
+  if (use_connect_keys()) {
+    // Inbound viewer data is accepted only under the write key. The relay can
+    // forward ciphertext, but cannot upgrade a read-only capability into a
+    // writer because ttyd itself enforces the split here.
+    if (decrypt_connect_payload(server->connect_write_key, payload, payload_len, &decrypted, &payload_len) != 0) {
+      lwsl_err("failed to decrypt inbound payload\n");
+      return -1;
+    }
+    payload = decrypted;
+  }
+#endif
+  int rc = 0;
+
   switch (command) {
     case INPUT:
-      if (!server->writable) return 0;
-      if (pss->process == NULL) return 0;
+      if (!server->writable) break;
+      if (pss->process == NULL) break;
       {
-        int err = pty_write(pss->process, pty_buf_init(pss->buffer + 1, pss->len - 1));
+        int err = pty_write(pss->process, pty_buf_init((char *) payload, payload_len));
         if (err) {
           lwsl_err("uv_write: %s (%s)\n", uv_err_name(err), uv_strerror(err));
-          return -1;
+          rc = -1;
+          break;
         }
       }
-      return 0;
+      break;
     case RESIZE_TERMINAL:
-      if (pss->process == NULL) return 0;
+      if (pss->process == NULL) break;
       json_object_put(
-          parse_window_size(pss->buffer + 1, pss->len - 1, &pss->process->columns, &pss->process->rows));
+          parse_window_size((const char *) payload, payload_len, &pss->process->columns, &pss->process->rows));
       pty_resize(pss->process);
-      return 0;
+      break;
     case PAUSE:
       if (pss->process != NULL) pty_pause(pss->process);
-      return 0;
+      break;
     case RESUME:
       if (pss->process != NULL) pty_resume(pss->process);
-      return 0;
+      break;
     default:
-      return 1;
+      rc = 1;
+      break;
   }
+
+#ifdef TTYD_OPENSSL_CRYPTO
+  if (decrypted != NULL) free(decrypted);
+#endif
+  return rc;
 }
 
 static void receive_cleanup(struct pss_tty *pss) {
